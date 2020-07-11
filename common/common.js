@@ -1,7 +1,7 @@
 /* globals config, Parser */
 'use strict';
 
-var tools = {};
+const tools = {};
 tools.cookies = url => {
   if (!url || !chrome.cookies) {
     return Promise.resolve('');
@@ -27,12 +27,12 @@ tools.fetch = ({url, method = 'GET', headers = {}, data = {}}) => {
   });
 };
 
-function notify(message) {
+function notify(e) {
   chrome.notifications.create({
+    title: chrome.runtime.getManifest().name,
     type: 'basic',
     iconUrl: '/data/icons/48.png',
-    title: config.name,
-    message: message.message || message
+    message: e.message || e
   });
 }
 function execute(d) {
@@ -42,6 +42,7 @@ function execute(d) {
         return notify('Command box is empty. Use options page to define one!');
       }
       const p = new Parser();
+      p.escapeExpressions = {}; // do not escape expressions
       tools.cookies(d.referrer).then(cookies => {
         // remove args that are not provided
         if (!d.referrer) {
@@ -49,6 +50,7 @@ function execute(d) {
         }
         if (!d.filename) {
           prefs.args = prefs.args.replace(/\s[^\s]*\[FILENAME\][^\s]*\s/, ' ');
+          prefs.args = prefs.args.replace(/\s[^\s]*\[DISK][^\s]*\s/, ' ');
         }
 
         let url = d.finalUrl || d.url;
@@ -64,16 +66,24 @@ function execute(d) {
             .replace(/\[REFERRER\]/g, d.referrer)
             .replace(/\[USERAGENT\]/g, navigator.userAgent)
             .replace(/\[FILENAME\]/g, (d.filename || '').split(/[/\\]/).pop())
+            .replace(/\[DISK\]/g, (d.filename || ''))
             .replace(/\\/g, '\\\\')
         };
+
         p.parseLine(termref);
 
+        window.setTimeout(resolve, config.delay || 5000);
         chrome.runtime.sendNativeMessage('com.add0n.native_client', {
           permissions: ['child_process', 'path', 'os', 'crypto', 'fs'],
           args: [cookies, prefs.executable, ...termref.argv],
           script: String.raw`
             const cookies = args[0];
-            const command = args[1].replace(/%([^%]+)%/g, (_, n) => env[n]);
+            const command = args[1].replace(/%([^%]+)%/g, (_, n) => {
+              if (n === 'ProgramFiles(x86)' && !env[n]) {
+                return env['ProgramFiles'];
+              }
+              return env[n];
+            });
             function execute () {
               const exe = require('child_process').spawn(command, args.slice(2), {
                 detached: true,
@@ -83,6 +93,7 @@ function execute(d) {
               exe.stdout.on('data', data => stdout += data);
               exe.stderr.on('data', data => stderr += data);
 
+              stdout += command;
               exe.on('close', code => {
                 push({code, stdout, stderr});
                 done();
@@ -122,12 +133,19 @@ function execute(d) {
             chrome.tabs.create({
               url: '/data/guide/index.html'
             });
-            return reject();
+            return reject(Error('empty response'));
           }
-          if (res && res.code !== 0) {
-            return reject(res.stderr || res.error || res.err);
+          else if (res.code !== 0) {
+            const msg = res.stderr || res.error || res.err;
+            console.warn(msg);
+            if (msg && msg.indexOf('ENOENT') !== -1) {
+              return reject(Error('Executable path cannot be located. Go to the options page and fix the path.'));
+            }
+            return reject(Error(msg));
           }
-          window.setTimeout(resolve, config.delay || 0);
+          else {
+            resolve();
+          }
         });
       });
     });
@@ -136,18 +154,21 @@ function execute(d) {
 
 function sendTo(d, tab = {}) {
   (config.pre ? config.pre.action() : Promise.resolve(false))
-    .then(running => !running && execute(d)).then(() => config.post && config.post.action(d, tab))
+    .then(running => !running && execute(d)).then(() => {
+      if (config.post) {
+        config.post.action(d, tab);
+      }
+    })
     .then(() => {
       if (d.id) {
         chrome.downloads.erase({
           id: d.id
         });
       }
-    })
-    .catch(e => e && notify(e));
+    }).catch(e => e && notify(e));
 }
 
-var id;
+let id;
 function observe(d, response = () => {}) {
   const mimes = localStorage.getItem('mimes') || '';
   if (mimes.indexOf(d.mime) !== -1) {
@@ -197,6 +218,7 @@ function changeState(enabled) {
       '19': 'data/icons/' + (enabled ? '' : 'disabled/') + '19.png',
       '32': 'data/icons/' + (enabled ? '' : 'disabled/') + '32.png',
       '38': 'data/icons/' + (enabled ? '' : 'disabled/') + '38.png',
+      '48': 'data/icons/' + (enabled ? '' : 'disabled/') + '48.png',
       '64': 'data/icons/' + (enabled ? '' : 'disabled/') + '64.png'
     }
   });
@@ -221,39 +243,124 @@ chrome.browserAction.onClicked.addListener(onCommand);
 onCommand(false);
 
 // contextMenus
-{
-  const callback = () => {
-    chrome.contextMenus.create({
-      id: 'open-link',
-      title: config.name,
-      contexts: ['link'],
-      documentUrlPatterns: ['*://*/*']
-    });
-    chrome.contextMenus.create({
-      id: 'open-video',
-      title: config.name,
-      contexts: ['video', 'audio'],
-      documentUrlPatterns: ['*://*/*']
-    });
-    chrome.contextMenus.create({
-      id: 'grab',
-      title: 'Download all Links',
-      contexts: ['page', 'browser_action'],
-      documentUrlPatterns: ['*://*/*']
-    });
-  };
-  chrome.runtime.onInstalled.addListener(callback);
-  chrome.runtime.onStartup.addListener(callback);
-}
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === 'grab') {
+const buildContexts = () => chrome.storage.local.get({
+  'context.open-link': true,
+  'context.open-video': true,
+  'context.grab': true,
+  'context.extract': true
+}, prefs => {
+  chrome.contextMenus.removeAll(() => {
+    if (prefs['context.open-link']) {
+      chrome.contextMenus.create({
+        id: 'open-link',
+        title: 'Download Link',
+        contexts: ['link'],
+        documentUrlPatterns: ['*://*/*']
+      });
+    }
+    if (prefs['context.open-video']) {
+      chrome.contextMenus.create({
+        id: 'open-video',
+        title: 'Download Media or Image',
+        contexts: ['video', 'audio', 'image'],
+        documentUrlPatterns: ['*://*/*']
+      });
+    }
+    if (prefs['context.grab']) {
+      chrome.contextMenus.create({
+        id: 'grab',
+        title: 'Download all Links',
+        contexts: ['page', 'browser_action'],
+        documentUrlPatterns: ['*://*/*']
+      });
+    }
+    if (prefs['context.extract']) {
+      chrome.contextMenus.create({
+        id: 'extract',
+        title: 'Extract Links from Selection',
+        contexts: ['selection'],
+        documentUrlPatterns: ['*://*/*']
+      });
+    }
+  });
+});
+chrome.runtime.onInstalled.addListener(buildContexts);
+chrome.runtime.onStartup.addListener(buildContexts);
+chrome.storage.onChanged.addListener(prefs => {
+  if (Object.keys(prefs).some(s => s.startsWith('context.'))) {
+    buildContexts();
+  }
+});
+
+const links = {};
+chrome.tabs.onRemoved.addListener(id => delete links[id]);
+
+const grab = mode => chrome.tabs.executeScript({
+  runAt: 'document_start',
+  code: `window.mode = "${mode}"`
+}, () => {
+  const lastError = chrome.runtime.lastError;
+  if (lastError) {
+    notify(lastError.message);
+  }
+  else {
     chrome.tabs.executeScript({
       runAt: 'document_start',
       file: '/data/grab/inject.js'
-    }, () => {
-      const lastError = chrome.runtime.lastError;
-      if (lastError) {
-        notify(lastError.message);
+    });
+  }
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'grab') {
+    chrome.permissions.request({
+      origins: ['*://*/*']
+    }, granted => {
+      if (granted) {
+        grab('none');
+      }
+      else {
+        notify('To extract links from all iframes of this page, the permission is needed');
+      }
+    });
+  }
+  else if (info.menuItemId === 'extract') {
+    const es = info.selectionText.match(
+      /(?:(?:https?|ftp|file):\/\/|www\.|ftp\.)(?:\([-A-Z0-9+&@#/%=~_|$?!:,.]*\)|[-A-Z0-9+&@#/%=~_|$?!:,.])*(?:\([-A-Z0-9+&@#/%=~_|$?!:,.]*\)|[A-Z0-9+&@#/%=~_|$])/igm
+    ) || [];
+    chrome.permissions.request({
+      origins: ['*://*/*']
+    }, granted => {
+      if (granted) {
+        chrome.tabs.executeScript(tab.id, {
+          frameId: info.frameId,
+          code: `window.extraLinks = ${JSON.stringify(es)};`
+        }, () => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            notify(lastError.message);
+          }
+          else {
+            chrome.tabs.executeScript(tab.is, {
+              frameId: info.frameId,
+              file: 'data/grab/selection.js'
+            }, a => {
+              if (a && a[0]) {
+                const es = a[0].filter((s, i, l) => s && l.indexOf(s) === i);
+                if (es.length) {
+                  links[tab.id] = es;
+                  grab('serve');
+                }
+                else {
+                  notify('Cannot extract any link from selected text');
+                }
+              }
+            });
+          }
+        });
+      }
+      else {
+        notify('To extract links and display the interface, this permission is needed');
       }
     });
   }
@@ -267,7 +374,10 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 //
 chrome.runtime.onMessage.addListener((request, sender, response) => {
-  if (request.method === 'exec') {
+  if (request.method === 'notify') {
+    notify(request.message);
+  }
+  else if (request.method === 'exec') {
     chrome.tabs.executeScript({
       runAt: 'document_start',
       code: request.code,
@@ -287,6 +397,48 @@ chrome.runtime.onMessage.addListener((request, sender, response) => {
     sendTo(Object.assign({
       referrer: sender.tab.url
     }, request.job), sender.tab);
+  }
+  else if (request.method === 'download-links') {
+    if (config.mode.method === 'batch') {
+      sendTo({
+        ...request.job,
+        referrer: sender.tab.url
+      }, sender.tab);
+    }
+    else {
+      (async () => {
+        const delay = () => new Promise(resolve => window.setTimeout(resolve, Number(localStorage.getItem('delay') || 1000)));
+
+        for (const finalUrl of request.job.url) {
+          sendTo({
+            finalUrl,
+            referrer: sender.tab.url
+          }, sender.tab);
+
+          await delay();
+        }
+      })();
+    }
+    chrome.tabs.sendMessage(sender.tab.id, {
+      cmd: 'close-me'
+    });
+  }
+  else if (request.method === 'head') {
+    const req = new XMLHttpRequest();
+    req.open('GET', request.link);
+    req.timeout = 10000;
+    req.ontimeout = req.onerror = () => response('');
+    req.onreadystatechange = () => {
+      if (req.readyState === req.HEADERS_RECEIVED) {
+        response(req.getResponseHeader('content-type') || '');
+        req.abort();
+      }
+    };
+    req.send();
+    return true;
+  }
+  else if (request.method === 'extracted-links') {
+    response(links[sender.tab.id] || []);
   }
 });
 
@@ -309,37 +461,29 @@ chrome.runtime.onMessage.addListener((request, sender, response) => {
   chrome.runtime.onInstalled.addListener(callback);
 }
 
-// FAQs & Feedback
-chrome.storage.local.get({
-  'version': null,
-  'faqs': true,
-  'last-update': 0
-}, prefs => {
-  const version = chrome.runtime.getManifest().version;
-
-  if (prefs.version ? (prefs.faqs && prefs.version !== version) : true) {
-    const now = Date.now();
-    const doUpdate = (now - prefs['last-update']) / 1000 / 60 / 60 / 24 > 30;
-    chrome.storage.local.set({
-      version,
-      'last-update': doUpdate ? Date.now() : prefs['last-update']
-    }, () => {
-      // do not display the FAQs page if last-update occurred less than 30 days ago.
-      if (doUpdate) {
-        const p = Boolean(prefs.version);
-        chrome.tabs.create({
-          url: chrome.runtime.getManifest().homepage_url + '&version=' + version +
-            '&type=' + (p ? ('upgrade&p=' + prefs.version) : 'install'),
-          active: p === false
-        });
-      }
-    });
-  }
-});
-
+/* FAQs & Feedback */
 {
-  const {name, version} = chrome.runtime.getManifest();
-  chrome.runtime.setUninstallURL(
-    chrome.runtime.getManifest().homepage_url + '&rd=feedback&name=' + name + '&version=' + version
-  );
+  const {management, runtime: {onInstalled, setUninstallURL, getManifest}, storage, tabs} = chrome;
+  if (navigator.webdriver !== true) {
+    const page = getManifest().homepage_url;
+    const {name, version} = getManifest();
+    onInstalled.addListener(({reason, previousVersion}) => {
+      management.getSelf(({installType}) => installType === 'normal' && storage.local.get({
+        'faqs': true,
+        'last-update': 0
+      }, prefs => {
+        if (reason === 'install' || (prefs.faqs && reason === 'update')) {
+          const doUpdate = (Date.now() - prefs['last-update']) / 1000 / 60 / 60 / 24 > 45;
+          if (doUpdate && previousVersion !== version) {
+            tabs.create({
+              url: page + '&version=' + version + (previousVersion ? '&p=' + previousVersion : '') + '&type=' + reason,
+              active: reason === 'install'
+            });
+            storage.local.set({'last-update': Date.now()});
+          }
+        }
+      }));
+    });
+    setUninstallURL(page + '&rd=feedback&name=' + encodeURIComponent(name) + '&version=' + version);
+  }
 }

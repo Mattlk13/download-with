@@ -1,11 +1,10 @@
-/* globals config */
 'use strict';
 
-var cache = [];
+const args = new URLSearchParams(location.search);
 
-var delay = () => new Promise(resolve => window.setTimeout(resolve, Number(localStorage.getItem('delay') || 1000)));
+const cache = [];
 
-var type = (type, url) => {
+const type = (type, url) => {
   const mimes = {
     'jpeg': 'image/jpeg',
     'jpg': 'image/jpg',
@@ -35,35 +34,26 @@ var type = (type, url) => {
   return (type || 'unknown').split(';')[0];
 };
 
-var analyze = tr => new Promise(resolve => {
-  const req = new XMLHttpRequest();
-  req.open('HEAD', tr.link);
-  req.timeout = 10000;
-  req.ontimeout = req.onerror = req.onload = () => {
+const analyze = tr => new Promise(resolve => {
+  chrome.runtime.sendMessage({
+    method: 'head',
+    link: tr.link
+  }, r => {
     tr.querySelector('[data-id=type]').textContent =
-      tr.dataset.type = type(req.getResponseHeader('content-type') || '', tr.link);
+      tr.dataset.type = type(r || '', tr.link);
     resolve();
-  };
-  req.send();
+  });
 });
 
-var resolve = async() => {
+const resolve = async () => {
   for (let i = 0; i < cache.length; i += 5) {
     await Promise.all(cache.slice(i, i + 5).map(analyze));
   }
 };
 
-chrome.runtime.sendMessage({
-  method: 'exec',
-  code: `[
-    ...[...document.images].map(i => i.src),
-    ...[...document.querySelectorAll('a')].map(a => a.href),
-    ...[...document.querySelectorAll('video')].map(v => v.src),
-    ...[...document.querySelectorAll('source')].map(v => v.src)
-  ].filter(s => s && (s.startsWith('http') || s.startsWith('ftp') || s.startsWith('data:')))`
-}, resp => {
-  const tbody = document.querySelector('tbody');
-  [].concat([], ...resp).filter((s, i, l) => s && l.indexOf(s) === i).forEach(link => {
+const tbody = document.querySelector('tbody');
+const next = links => {
+  links.filter((s, i, l) => s && l.indexOf(s) === i).forEach(link => {
     const t = document.getElementById('tr');
     const clone = document.importNode(t.content, true);
     const tr = clone.querySelector('tr');
@@ -72,7 +62,26 @@ chrome.runtime.sendMessage({
     cache.push(tr);
   });
   resolve();
-});
+};
+
+if (args.get('mode') === 'serve') {
+  chrome.runtime.sendMessage({
+    method: 'extracted-links'
+  }, next);
+}
+else {
+  chrome.runtime.sendMessage({
+    method: 'exec',
+    code: `[
+      ...[...document.images].map(i => i.src),
+      ...[...document.querySelectorAll('a')].map(a => a.href),
+      ...[...document.querySelectorAll('video')].map(v => v.src),
+      ...[...document.querySelectorAll('source')].map(v => v.src)
+    ].filter(s => s && (s.startsWith('http') || s.startsWith('ftp') || s.startsWith('data:')))`
+  }, resp => {
+    next([].concat([], ...resp));
+  });
+}
 
 //
 document.addEventListener('change', e => {
@@ -94,6 +103,11 @@ document.addEventListener('change', e => {
   document.getElementById('download').value = inputs.length ? `Download (${inputs.length})` : 'Download';
 });
 //
+const notify = message => chrome.runtime.sendMessage({
+  method: 'notify',
+  message
+});
+
 document.addEventListener('click', async e => {
   const cmd = e.target.dataset.cmd || '';
   if (cmd === 'image/' || cmd === 'application/pdf' || cmd === 'application/') {
@@ -110,35 +124,31 @@ document.addEventListener('click', async e => {
     }));
   }
   else if (cmd === 'download') {
-    if (config.mode.method === 'batch') {
-      chrome.runtime.sendMessage({
-        method: 'download',
-        job: {
-          url: e.target.inputs.map(input => input.closest('tr').link)
-        }
-      });
-    }
-    else {
-      for (const input of e.target.inputs) {
-        chrome.runtime.sendMessage({
-          method: 'download',
-          job: {
-            finalUrl: input.closest('tr').link
-          }
-        });
-        await delay();
+    chrome.runtime.sendMessage({
+      method: 'download-links',
+      job: {
+        url: e.target.inputs.map(input => input.closest('tr').link)
       }
-    }
+    });
   }
   else if (cmd === 'copy') {
-    const el = document.createElement('textarea');
-    el.value = e.target.inputs.map(input => input.closest('tr').link).join('\n');
-    el.style.position = 'absolute';
-    el.style.left = '-9999px';
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand('copy');
-    document.body.removeChild(el);
+    const links = e.target.inputs.map(input => input.closest('tr').link);
+    navigator.clipboard.writeText(links.join('\n')).catch(e => {
+      const el = document.createElement('textarea');
+      el.value = links.join('\n');
+      el.style.position = 'absolute';
+      el.style.left = '-9999px';
+      document.body.appendChild(el);
+      el.select();
+      const r = document.execCommand('copy');
+      document.body.removeChild(el);
+      if (!r) {
+        throw e;
+      }
+    }).then(
+      () => notify(links.length + ' link(s) copied to the clipboard'),
+      e => notify(e.message)
+    );
   }
 });
 //
